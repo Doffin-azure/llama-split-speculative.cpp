@@ -108,6 +108,14 @@ int main(int argc, char ** argv) {
     int n_predict = 0;
     int n_drafted = 0;
     int n_accept  = 0;
+    int n_round   = 0;
+    int n_round_reject = 0;
+
+    int64_t t_draft_total_us    = 0;
+    int64_t t_decode_total_us   = 0;
+    int64_t t_sample_total_us   = 0;
+    int64_t t_post_total_us     = 0;
+    int64_t t_reject_post_us    = 0;
 
     // used to determine end of generation
     bool has_eos = false;
@@ -147,6 +155,9 @@ int main(int argc, char ** argv) {
     const auto t_dec_start = ggml_time_us();
 
     while (true) {
+        ++n_round;
+        const auto t_round_begin = ggml_time_us();
+
         // optionally, generate draft tokens that can be appended to the target batch
         //
         // this is the most important part of the speculation. the more probable tokens that are provided here
@@ -154,7 +165,10 @@ int main(int argc, char ** argv) {
         // offloaded to a remote device. it doesn't even have to be based on an LLM. instead, it can provide tokens
         // from a cache or lookup tables.
         //
+        const auto t_draft_begin = ggml_time_us();
         llama_tokens draft = common_speculative_draft(spec, params_spec, prompt_tgt, id_last);
+        const auto t_draft_end = ggml_time_us();
+        t_draft_total_us += t_draft_end - t_draft_begin;
 
         //LOG_DBG("draft: %s\n", string_from(ctx_dft, draft).c_str());
 
@@ -163,6 +177,7 @@ int main(int argc, char ** argv) {
         common_batch_add  (batch_tgt, id_last, n_past++, { 0 }, true);
 
         // evaluate the target model on [id_last, draft0, draft1, ..., draftN-1]
+        const auto t_decode_begin = ggml_time_us();
         {
             // do not waste time on small drafts
             if (draft.size() < (size_t) params_spec.n_min) {
@@ -177,6 +192,8 @@ int main(int argc, char ** argv) {
 
             llama_decode(ctx_tgt, batch_tgt);
         }
+        const auto t_decode_end = ggml_time_us();
+        t_decode_total_us += t_decode_end - t_decode_begin;
 
         // sample from the full target batch and return the accepted tokens based on the target sampler
         //
@@ -185,7 +202,10 @@ int main(int argc, char ** argv) {
         // available logits from the batch and sample the next token until we run out of logits or the sampler
         // disagrees with the draft
         //
+        const auto t_sample_begin = ggml_time_us();
         const auto ids = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
+        const auto t_sample_end = ggml_time_us();
+        t_sample_total_us += t_sample_end - t_sample_begin;
 
         //LOG_DBG("ids: %s\n", string_from(ctx_tgt, ids).c_str());
 
@@ -222,11 +242,31 @@ int main(int argc, char ** argv) {
 
         LOG_DBG("accepted %d/%d draft tokens, the last target token is: (%d)\n", (int) ids.size() - 1, (int) draft.size(), id_last);
 
+        const auto t_post_begin = ggml_time_us();
         {
             LOG_DBG("clear kv cache from any extra tokens, n_past = %d\n", n_past);
 
             llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
         }
+        const auto t_post_end = ggml_time_us();
+        t_post_total_us += t_post_end - t_post_begin;
+
+        const bool had_reject = ((int) ids.size() - 1) < (int) draft.size();
+        if (had_reject) {
+            ++n_round_reject;
+            t_reject_post_us += t_post_end - t_post_begin;
+        }
+
+        LOG_INF("[spec-simple][timing] round=%d drafted=%zu accept=%d reject=%d draft=%.3fms decode=%.3fms sample=%.3fms post=%.3fms total=%.3fms\n",
+                n_round,
+                draft.size(),
+                (int) ids.size() - 1,
+                had_reject ? 1 : 0,
+                (t_draft_end - t_draft_begin) / 1000.0,
+                (t_decode_end - t_decode_begin) / 1000.0,
+                (t_sample_end - t_sample_begin) / 1000.0,
+                (t_post_end - t_post_begin) / 1000.0,
+                (t_post_end - t_round_begin) / 1000.0);
 
         if ((params.n_predict >= 0 && n_predict > params.n_predict) || has_eos) {
             break;
@@ -248,6 +288,13 @@ int main(int argc, char ** argv) {
     LOG_INF("n_drafted = %d\n", n_drafted);
     LOG_INF("n_accept  = %d\n", n_accept);
     LOG_INF("accept    = %.3f%%\n", 100.0f * n_accept / n_drafted);
+    LOG_INF("rounds    = %d\n", n_round);
+    LOG_INF("reject_rounds = %d\n", n_round_reject);
+    LOG_INF("timing_avg_draft_ms  = %.3f\n", n_round > 0 ? (t_draft_total_us / 1000.0) / n_round : 0.0);
+    LOG_INF("timing_avg_decode_ms = %.3f\n", n_round > 0 ? (t_decode_total_us / 1000.0) / n_round : 0.0);
+    LOG_INF("timing_avg_sample_ms = %.3f\n", n_round > 0 ? (t_sample_total_us / 1000.0) / n_round : 0.0);
+    LOG_INF("timing_avg_post_ms   = %.3f\n", n_round > 0 ? (t_post_total_us / 1000.0) / n_round : 0.0);
+    LOG_INF("timing_reject_post_avg_ms = %.3f\n", n_round_reject > 0 ? (t_reject_post_us / 1000.0) / n_round_reject : 0.0);
 
     LOG_INF("\n");
     LOG_INF("draft:\n\n");

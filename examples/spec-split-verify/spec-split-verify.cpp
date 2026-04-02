@@ -116,6 +116,10 @@ static void append_text(const fs::path & p, const std::string & s) {
     f << s;
 }
 
+static int64_t now_us() {
+    return ggml_time_us();
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     common_init();
@@ -229,6 +233,7 @@ int main(int argc, char ** argv) {
     LOG_INF("[verify-native] started, shared_dir=%s\n", args.shared_dir.c_str());
 
     while (true) {
+        const int64_t t_loop_us = now_us();
         state = read_json(state_path);
         json config = read_json(config_path);
         if (state.is_null() || config.is_null()) {
@@ -254,6 +259,7 @@ int main(int argc, char ** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(args.poll_ms));
             continue;
         }
+        const int64_t t_proposal_seen_us = now_us();
 
         std::vector<llama_token> draft_ids;
         if (proposal.contains("draft_token_ids") && proposal["draft_token_ids"].is_array()) {
@@ -261,8 +267,17 @@ int main(int argc, char ** argv) {
                 draft_ids.push_back(el.get<llama_token>());
             }
         }
+        int64_t proposal_to_verify_seen_us = -1;
+        if (proposal.contains("timing") && proposal["timing"].is_object()) {
+            const auto & tim = proposal["timing"];
+            if (tim.contains("proposal_write_us")) {
+                const int64_t t_prop_write_us = tim["proposal_write_us"].get<int64_t>();
+                proposal_to_verify_seen_us = t_proposal_seen_us - t_prop_write_us;
+            }
+        }
 
         // Evaluate [id_last, draft...].
+        const int64_t t_decode_begin_us = now_us();
         common_batch_clear(batch_tgt);
         common_batch_add(batch_tgt, id_last, n_past++, { 0 }, true);
         for (size_t i = 0; i < draft_ids.size(); ++i) {
@@ -274,13 +289,16 @@ int main(int argc, char ** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(args.poll_ms));
             continue;
         }
+        const int64_t t_decode_end_us = now_us();
 
+        const int64_t t_sample_begin_us = now_us();
         const auto ids = common_sampler_sample_and_accept_n(smpl, ctx, draft_ids);
         if (ids.empty()) {
             LOG_ERR("[verify-native] empty ids at round %d\n", round_id);
             std::this_thread::sleep_for(std::chrono::milliseconds(args.poll_ms));
             continue;
         }
+        const int64_t t_sample_end_us = now_us();
 
         n_past += (int) ids.size() - 1;
         const int accepted_draft = std::max(0, (int) ids.size() - 1);
@@ -293,7 +311,9 @@ int main(int argc, char ** argv) {
         }
 
         // Rollback non-accepted speculative tail in target KV.
+        const int64_t t_rollback_begin_us = now_us();
         llama_memory_seq_rm(llama_get_memory(ctx), 0, n_past, -1);
+        const int64_t t_rollback_end_us = now_us();
 
         const std::string result_text = common_detokenize(ctx, ids, false);
         append_text(document_path, result_text);
@@ -301,6 +321,8 @@ int main(int argc, char ** argv) {
         bool has_eos = llama_vocab_is_eog(vocab, id_last);
         const bool done = has_eos || ((int) accepted_ids.size() >= max_output_tokens);
         const int new_accepted_pos = accepted_pos + (int) ids.size();
+        const int64_t t_decision_write_us = now_us();
+        const bool had_reject = accepted_draft < (int) draft_ids.size();
 
         json decision = {
             {"round", round_id},
@@ -311,6 +333,22 @@ int main(int argc, char ** argv) {
             {"new_accepted_pos", new_accepted_pos},
             {"done", done},
             {"exhausted", false},
+            {"timing", {
+                {"loop_start_us", t_loop_us},
+                {"proposal_seen_us", t_proposal_seen_us},
+                {"proposal_to_verify_seen_us", proposal_to_verify_seen_us},
+                {"decode_begin_us", t_decode_begin_us},
+                {"decode_end_us", t_decode_end_us},
+                {"sample_begin_us", t_sample_begin_us},
+                {"sample_end_us", t_sample_end_us},
+                {"rollback_begin_us", t_rollback_begin_us},
+                {"rollback_end_us", t_rollback_end_us},
+                {"decision_write_us", t_decision_write_us},
+                {"had_reject", had_reject},
+                {"draft_count", (int) draft_ids.size()},
+                {"accepted_draft", accepted_draft},
+                {"emitted_count", (int) ids.size()},
+            }},
         };
         write_json(decision_path, decision);
 
@@ -323,8 +361,15 @@ int main(int argc, char ** argv) {
         std::error_code ec;
         fs::remove(proposal_path, ec);
 
-        LOG_INF("[verify-native] round %d accepted_draft=%d emitted=%zu\n",
-                round_id, accepted_draft, ids.size());
+        LOG_INF("[verify-native][timing] round=%d draft=%zu accept=%d reject=%d comm=%.3fms decode=%.3fms sample=%.3fms rollback=%.3fms\n",
+                round_id,
+                draft_ids.size(),
+                accepted_draft,
+                had_reject ? 1 : 0,
+                proposal_to_verify_seen_us >= 0 ? proposal_to_verify_seen_us / 1000.0 : -1.0,
+                (t_decode_end_us - t_decode_begin_us) / 1000.0,
+                (t_sample_end_us - t_sample_begin_us) / 1000.0,
+                (t_rollback_end_us - t_rollback_begin_us) / 1000.0);
         if (done) {
             LOG_INF("[verify-native] target stream fully emitted\n");
             break;

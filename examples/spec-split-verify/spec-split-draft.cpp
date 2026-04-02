@@ -137,6 +137,10 @@ static bool decode_append(
     return true;
 }
 
+static int64_t now_us() {
+    return ggml_time_us();
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     common_init();
@@ -202,6 +206,7 @@ int main(int argc, char ** argv) {
     LOG_INF("[draft-native] started, shared_dir=%s\n", args.shared_dir.c_str());
 
     while (true) {
+        const int64_t t_loop_us = now_us();
         json state = read_json(state_path);
         json config = read_json(config_path);
         if (state.is_null() || config.is_null()) {
@@ -221,11 +226,26 @@ int main(int argc, char ** argv) {
         const int round_id = state.value("round", 0);
         const int accepted_pos = state.value("accepted_pos", 0);
         const int n_max = config.value("n_max", args.n_max);
+        const int64_t t_state_seen_us = now_us();
 
         json cur_prop = read_json(proposal_path);
         if (!cur_prop.is_null() && cur_prop.value("round", -1) == round_id) {
             std::this_thread::sleep_for(std::chrono::milliseconds(args.poll_ms));
             continue;
+        }
+
+        int64_t t_decision_seen_us = 0;
+        int64_t decision_to_draft_seen_us = -1;
+        const json prev_decision = read_json(decision_path);
+        if (!prev_decision.is_null() && prev_decision.value("round", -1) == round_id - 1) {
+            t_decision_seen_us = now_us();
+            if (prev_decision.contains("timing") && prev_decision["timing"].is_object()) {
+                const auto & tim = prev_decision["timing"];
+                if (tim.contains("decision_write_us")) {
+                    const int64_t t_write_us = tim["decision_write_us"].get<int64_t>();
+                    decision_to_draft_seen_us = t_decision_seen_us - t_write_us;
+                }
+            }
         }
 
         // Authoritative accepted sequence from verify side.
@@ -239,11 +259,15 @@ int main(int argc, char ** argv) {
         target_seq.insert(target_seq.end(), accepted_ids.begin(), accepted_ids.end());
 
         // Sync local draft context to authoritative sequence.
+        const int64_t t_sync_begin_us = now_us();
+        bool did_rollback = false;
+        bool did_hard_reset = false;
         const size_t cp = lcp_len(prompt_dft, target_seq);
         const bool mismatch_inside_prefix = cp < std::min(prompt_dft.size(), target_seq.size());
 
         if (mismatch_inside_prefix) {
             // Hard reset if prefix diverged.
+            did_hard_reset = true;
             llama_memory_clear(llama_get_memory(ctx), false);
             prompt_dft.clear();
             if (!decode_append(ctx, batch, prompt_dft, target_seq)) {
@@ -254,6 +278,7 @@ int main(int argc, char ** argv) {
         } else {
             if (prompt_dft.size() > target_seq.size()) {
                 // Rollback speculative tail not confirmed by verifier.
+                did_rollback = true;
                 llama_memory_seq_rm(llama_get_memory(ctx), 0, (llama_pos) target_seq.size(), -1);
                 prompt_dft.resize(target_seq.size());
             }
@@ -268,6 +293,7 @@ int main(int argc, char ** argv) {
                 }
             }
         }
+        const int64_t t_sync_end_us = now_us();
 
         if (prompt_dft.empty()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(args.poll_ms));
@@ -275,6 +301,7 @@ int main(int argc, char ** argv) {
         }
 
         // Ensure next-token logits align to the current tail token after any rollback.
+        const int64_t t_tail_refresh_begin_us = now_us();
         {
             const llama_token tail = prompt_dft.back();
             llama_memory_seq_rm(llama_get_memory(ctx), 0, (llama_pos) (prompt_dft.size() - 1), -1);
@@ -286,8 +313,10 @@ int main(int argc, char ** argv) {
                 continue;
             }
         }
+        const int64_t t_tail_refresh_end_us = now_us();
 
         // Draft generation (greedy) and keep speculative tail in prompt_dft.
+        const int64_t t_draft_begin_us = now_us();
         common_sampler_reset(smpl);
         for (llama_token t : prompt_dft) {
             common_sampler_accept(smpl, t, false);
@@ -306,9 +335,11 @@ int main(int argc, char ** argv) {
                 break;
             }
         }
+        const int64_t t_draft_end_us = now_us();
 
         const std::string draft_text = common_detokenize(ctx, draft_ids, false);
         const int id_last = accepted_ids.empty() ? -1 : accepted_ids.back();
+        const int64_t t_proposal_write_us = now_us();
 
         json proposal = {
             {"round", round_id},
@@ -317,11 +348,33 @@ int main(int argc, char ** argv) {
             {"draft_token_ids", draft_ids},
             {"draft_text", draft_text},
             {"n_max", n_max},
+            {"timing", {
+                {"loop_start_us", t_loop_us},
+                {"state_seen_us", t_state_seen_us},
+                {"decision_seen_us", t_decision_seen_us},
+                {"decision_to_draft_seen_us", decision_to_draft_seen_us},
+                {"sync_begin_us", t_sync_begin_us},
+                {"sync_end_us", t_sync_end_us},
+                {"tail_refresh_begin_us", t_tail_refresh_begin_us},
+                {"tail_refresh_end_us", t_tail_refresh_end_us},
+                {"draft_begin_us", t_draft_begin_us},
+                {"draft_end_us", t_draft_end_us},
+                {"proposal_write_us", t_proposal_write_us},
+                {"did_rollback", did_rollback},
+                {"did_hard_reset", did_hard_reset},
+            }},
         };
         write_json(proposal_path, proposal);
 
-        LOG_INF("[draft-native] round %d id_last=%d drafted=%zu\n",
-                round_id, id_last, draft_ids.size());
+        LOG_INF("[draft-native][timing] round=%d drafted=%zu sync=%.3fms tail=%.3fms draft=%.3fms decision->draft=%.3fms rollback=%d hard_reset=%d\n",
+                round_id,
+                draft_ids.size(),
+                (t_sync_end_us - t_sync_begin_us) / 1000.0,
+                (t_tail_refresh_end_us - t_tail_refresh_begin_us) / 1000.0,
+                (t_draft_end_us - t_draft_begin_us) / 1000.0,
+                decision_to_draft_seen_us >= 0 ? decision_to_draft_seen_us / 1000.0 : -1.0,
+                did_rollback ? 1 : 0,
+                did_hard_reset ? 1 : 0);
 
         std::this_thread::sleep_for(std::chrono::milliseconds(args.poll_ms));
     }
