@@ -1,0 +1,11 @@
+set(TARGET llama-spec-split-verify)
+add_executable(${TARGET} spec-split-verify.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+set(TARGET_DRAFT llama-spec-split-draft)
+add_executable(${TARGET_DRAFT} spec-split-draft.cpp)
+install(TARGETS ${TARGET_DRAFT} RUNTIME)
+target_link_libraries(${TARGET_DRAFT} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET_DRAFT} PRIVATE cxx_std_17)
