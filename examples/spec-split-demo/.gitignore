@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+shared/*.log
+shared/*.pid
+shared/config.json
+shared/state.json
+shared/proposal.json
+shared/decision.json
+shared/document.md
